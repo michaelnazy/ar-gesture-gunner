@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AR Gesture Gunner - PROTOTYPE v2</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Montserrat', 'Segoe UI', sans-serif; cursor: none;}
+        #gameCanvas { display: block; width: 100vw; height: 100vh; transform: scaleX(-1); /* Mirror webcam */ }
+        #ui { position: absolute; top: 30px; left: 30px; color: #fff; z-index: 10; font-weight: 300; letter-spacing: 2px; }
+        #scoreVal { font-size: 48px; font-weight: bold; color: #0ff; text-shadow: 0 0 10px #0ff, 0 0 20px #0ff; }
+        #scoreLabel {font-size: 14px; opacity: 0.7;}
+        #startButton { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 25px 50px; font-size: 28px; background: linear-gradient(135deg, #0f0 0%, #0ff 100%); color: #000; border: none; cursor: pointer; z-index: 20; font-weight: bold; border-radius: 12px; transition: all 0.2s; box-shadow: 0 0 20px rgba(0, 255, 255, 0.5); font-family: 'Segoe UI', sans-serif;}
+        #startButton:hover { transform: translate(-50%, -50%) scale(1.05); box-shadow: 0 0 40px rgba(0, 255, 255, 0.8); }
+        #loading { position: absolute; top: 60%; left: 50%; transform: translate(-50%, -50%); color: #fff; font-size: 20px; display: none; z-index: 20; letter-spacing: 1px;}
+    </style>
+</head>
+<body>
+
+<button id="startButton">SYSTEM INITIATE</button>
+<div id="loading">Synchronizing Hand Tracking AI...</div>
+<div id="ui">
+    <div id="scoreLabel">OPERATIONAL SCORE</div>
+    <div id="scoreVal">0</div>
+</div>
+
+<video id="inputVideo" style="display:none;" autoplay playsinline></video>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+    const videoElement = document.getElementById('inputVideo');
+    const canvasElement = document.getElementById('gameCanvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const scoreEl = document.getElementById('scoreVal');
+    const startBtn = document.getElementById('startButton');
+    const loadingText = document.getElementById('loading');
+
+    // --- ENHANCED GAME STATE & VFX ---
+    let score = 0;
+    let enemies = [];
+    let particles = []; // New particle system array
+    let hitTexts = [];
+    let isReadyToShoot = true;
+    let activeLaserBeam = null; // Visual object for momentary firing laser
+
+    const MAGNETIC_RADIUS = 120; // Slightly larger for better feel
+    const MAX_ENEMIES = 4;
+    const PARTICLE_COUNT_PER_HIT = 25; // More particles for bigger explosions
+
+    // Resize Canvas to fit screen
+    function resizeCanvas() {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // Enhanced Synthesized sounds (Faster, cleaner feedback)
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playShootSound(isHit) {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        if (isHit) {
+            // Shatter/Explosion sound
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.1);
+            gain.gain.setValueAtTime(0.6, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+        } else {
+            // Cleaner, modern laser sound
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(500, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.08);
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        }
+
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.15);
+    }
+
+    // --- NEW! EXPLOSION PARTICLE SYSTEM ---
+    function createExplosion(x, y, color) {
+        for (let i = 0; i < PARTICLE_COUNT_PER_HIT; i++) {
+            particles.push({
+                x: x, y: y,
+                vx: (Math.random() - 0.5) * 12, // Random velocity X
+                vy: (Math.random() - 0.5) * 12, // Random velocity Y
+                radius: 2 + Math.random() * 4,
+                alpha: 1.0,
+                decay: 0.02 + Math.random() * 0.03, // Variable decay speed
+                color: color
+            });
+        }
+    }
+
+    // --- GAME LOGIC UPDATES ---
+    function spawnEnemy() {
+        let x, y;
+        if (Math.random() > 0.5) {
+            x = Math.random() > 0.5 ? 0 : canvasElement.width;
+            y = Math.random() * canvasElement.height;
+        } else {
+            x = Math.random() * canvasElement.width;
+            y = Math.random() > 0.5 ? 0 : canvasElement.height;
+        }
+
+        const centerX = canvasElement.width / 2;
+        const centerY = canvasElement.height / 2;
+        const angle = Math.atan2(centerY - y, centerX - x) + (Math.random() - 0.5) * 0.3; // Less variance
+        const speed = 3 + Math.random() * 3; // Slightly faster
+
+        // Generate hue (keep bright colors)
+        const hue = Math.random() * 360;
+
+        enemies.push({
+            x: x, y: y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            radius: 45,
+            hue: hue,
+            color: `hsl(${hue}, 100%, 60%)`,
+            glow: `hsl(${hue}, 100%, 80%)`,
+            innerColor: `hsl(${hue}, 100%, 90%)`
+        });
+    }
+
+    function updateGame() {
+        while (enemies.length < MAX_ENEMIES) {
+            spawnEnemy();
+        }
+
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            let e = enemies[i];
+            e.x += e.vx;
+            e.y += e.vy;
+            if (e.x < -150 || e.x > canvasElement.width + 150 || e.y < -150 || e.y > canvasElement.height + 150) {
+                enemies.splice(i, 1);
+            }
+        }
+
+        // --- Update Explosions ---
+        for (let i = particles.length - 1; i >= 0; i--) {
+            let p = particles[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            p.vy += 0.1; // Subtle gravity effect
+            p.vx *= 0.98; // Drag effect
+            p.radius *= 0.97; // Particles shrink
+            p.alpha -= p.decay;
+            if (p.alpha <= 0 || p.radius < 0.5) particles.splice(i, 1);
+        }
+
+        // Update Active Firing Laser (fade quickly)
+        if (activeLaserBeam) {
+            activeLaserBeam.alpha -= 0.15; // Fast fade (about 6 frames)
+            if (activeLaserBeam.alpha <= 0) activeLaserBeam = null;
+        }
+
+        // Update Floating Hit Texts (Slow float, slow fade)
+        for (let i = hitTexts.length - 1; i >= 0; i--) {
+            hitTexts[i].y -= 1.5;
+            hitTexts[i].alpha -= 0.015;
+            if (hitTexts[i].alpha <= 0) hitTexts.splice(i, 1);
+        }
+    }
+
+    function triggerShot(startX, startY, endX, endY) {
+        let hit = false;
+        let hitColor = null;
+
+        // Check collision with enemies (priority to snapped target)
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            let e = enemies[i];
+            let dist = Math.hypot(endX - e.x, endY - e.y);
+            if (dist < e.radius + 15) {
+                hit = true;
+                score += 100;
+                scoreEl.innerText = score;
+
+                // Trigger Explosion
+                createExplosion(e.x, e.y, e.glow);
+
+                hitTexts.push({ x: e.x, y: e.y, text: "+100", alpha: 1.0, color: e.innerColor });
+                hitColor = e.glow;
+                enemies.splice(i, 1); // Destroy enemy
+                break;
+            }
+        }
+
+        // Setup the momentery firing laser effect
+        activeLaserBeam = {
+            startX: startX, startY: startY,
+            endX: endX, endY: endY,
+            alpha: 1.0,
+            isHit: hit,
+            hitHue: hit ? hitColor : '#fff'
+        };
+
+        if (!hit) {
+            hitTexts.push({ x: endX, y: endY, text: "MISS", alpha: 1.0, color: '#f00' });
+        }
+        playShootSound(hit);
+    }
+
+    // --- ENHANCED MEDIAPIPE LOGIC & RENDERING ---
+
+    function onResults(results) {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+        // Draw webcam feed
+        if (results.image) {
+            // Subtly darking the background to make game elements POP
+            canvasCtx.globalAlpha = 0.8; // webcam is slightly dimmer
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.globalAlpha = 1.0;
+
+            // Add dark overlay tint for better AR feel
+            canvasCtx.fillStyle = "rgba(0, 0, 10, 0.4)";
+            canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+        }
+
+        updateGame();
+
+        // --- Enhanced Enemy Drawing (Stylized Plasma Targets) ---
+        canvasCtx.lineWidth = 4;
+        for (let e of enemies) {
+            canvasCtx.save();
+
+            // Outer Glow effect
+            canvasCtx.shadowBlur = 25;
+            canvasCtx.shadowColor = e.glow;
+
+            // Main Circle Body
+            canvasCtx.beginPath();
+            canvasCtx.arc(e.x, e.y, e.radius, 0, 2 * Math.PI);
+            canvasCtx.strokeStyle = e.color;
+            canvasCtx.stroke();
+
+            // Inner bright Core
+            canvasCtx.beginPath();
+            canvasCtx.arc(e.x, e.y, e.radius / 1.5, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = "rgba(255, 255, 255, 0.2)";
+            canvasCtx.fill();
+            canvasCtx.strokeStyle = e.innerColor;
+            canvasCtx.lineWidth = 2;
+            canvasCtx.stroke();
+
+            // Abstract "energy core" markings
+            canvasCtx.beginPath();
+            canvasCtx.arc(e.x, e.y, e.radius / 4, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = e.innerColor;
+            canvasCtx.fill();
+
+            canvasCtx.restore();
+        }
+
+        // --- Draw Explosions Particles ---
+        for (let p of particles) {
+            canvasCtx.save();
+            canvasCtx.beginPath();
+            canvasCtx.arc(p.x, p.y, p.radius, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = `hsla(${p.color.match(/\d+/)[0]}, 100%, 90%, ${p.alpha})`;
+            // Add particle glow
+            canvasCtx.shadowBlur = 10;
+            canvasCtx.shadowColor = p.color;
+            canvasCtx.fill();
+            canvasCtx.restore();
+        }
+
+        // --- Process Hand Data & AIMING Lazer ---
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+
+            // Get absolute coordinates
+            const indexTip = { x: landmarks[8].x * canvasElement.width, y: landmarks[8].y * canvasElement.height };
+            const indexBase = { x: landmarks[5].x * canvasElement.width, y: landmarks[5].y * canvasElement.height }; // Base knuckle
+            const thumbTip = { x: landmarks[4].x * canvasElement.width, y: landmarks[4].y * canvasElement.height };
+
+            // 1. Aim Assist
+            let targetX = indexTip.x;
+            let targetY = indexTip.y;
+            let snapped = false;
+            let snappedHue = null;
+
+            for (let e of enemies) {
+                let distToEnemy = Math.hypot(targetX - e.x, targetY - e.y);
+                if (distToEnemy < MAGNETIC_RADIUS) {
+                    targetX = e.x;
+                    targetY = e.y;
+                    snapped = true;
+                    snappedHue = e.glow;
+                    break; // Snap to first one found
+                }
+            }
+
+            // --- NEW! Continuous Aiming Laser (From FingerTip to Crosshair) ---
+            canvasCtx.save();
+            canvasCtx.beginPath();
+            canvasCtx.moveTo(indexTip.x, indexTip.y); // Start from finger tip
+            canvasCtx.lineTo(targetX, targetY);
+            canvasCtx.lineWidth = snapped ? 3 : 2;
+            canvasCtx.strokeStyle = snapped ? snappedHue : 'rgba(0, 255, 0, 0.4)';
+            canvasCtx.shadowBlur = snapped ? 15 : 0;
+            canvasCtx.shadowColor = snapped ? snappedHue : 'none';
+            canvasCtx.setLineDash([10, 5]); // Dotted line for aiming
+            canvasCtx.stroke();
+            canvasCtx.restore();
+
+            // Draw Crosshair (Updated to glow when snapped)
+            canvasCtx.save();
+            canvasCtx.beginPath();
+            canvasCtx.arc(targetX, targetY, 20, 0, 2 * Math.PI);
+            canvasCtx.lineWidth = 3;
+            canvasCtx.strokeStyle = snapped ? '#fff' : 'rgba(0, 255, 0, 0.7)';
+            // Crosshair glow
+            canvasCtx.shadowBlur = 20;
+            canvasCtx.shadowColor = snapped ? snappedHue : 'rgba(0, 255, 0, 0.5)';
+            canvasCtx.stroke();
+
+            // Crosshair center dot
+            canvasCtx.beginPath();
+            canvasCtx.arc(targetX, targetY, 4, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = snapped ? '#fff' : 'rgba(0, 255, 0, 0.7)';
+            canvasCtx.fill();
+            canvasCtx.restore();
+
+            // 2. Gesture Recognition ("Pistol" Trigger Pull)
+            // Distance between thumb tip and base of index finger (trigger distance)
+            let triggerDistance = Math.hypot(thumbTip.x - indexBase.x, thumbTip.y - indexBase.y);
+            const TRIGGER_THRESHOLD = 60; // Tweak this for sensitivity
+
+            if (triggerDistance < TRIGGER_THRESHOLD) {
+                if (isReadyToShoot) {
+                    // Pass finger BASE to triggerShot as laser origin for proper "finger gun" effect
+                    triggerShot(indexBase.x, indexBase.y, targetX, targetY);
+                    isReadyToShoot = false; // Require reload
+                }
+            } else {
+                isReadyToShoot = true; // Reloaded
+            }
+        }
+
+        // --- NEW! Momentary FIRING Laser Beam VFX ---
+        if (activeLaserBeam) {
+            canvasCtx.save();
+            canvasCtx.globalCompositeOperation = 'lighter'; // Additive blending for BRIGHT glow
+
+            const b = activeLaserBeam;
+            // Core beam
+            canvasCtx.beginPath();
+            canvasCtx.moveTo(b.startX, b.startY);
+            canvasCtx.lineTo(b.endX, b.endY);
+            canvasCtx.lineWidth = b.isHit ? 10 : 4; // Thicker on hit
+            canvasCtx.strokeStyle = `rgba(255, 255, 255, ${b.alpha})`;
+            // Firing beam glow
+            canvasCtx.shadowBlur = 30;
+            canvasCtx.shadowColor = b.hitHue;
+            canvasCtx.stroke();
+
+            // Add secondary coloring on hit
+            if (b.isHit) {
+                canvasCtx.lineWidth = 20;
+                canvasCtx.shadowBlur = 50; // Massively bright glow
+                canvasCtx.strokeStyle = `hsla(${b.hitHue.match(/\d+/)[0]}, 100%, 70%, ${b.alpha * 0.5})`;
+                canvasCtx.stroke();
+            }
+
+            canvasCtx.restore();
+        }
+
+        // Draw Floating Hit Texts (Improved styling)
+        canvasCtx.save();
+        canvasCtx.scale(-1, 1); // Un-mirror text
+        canvasCtx.textAlign = "center";
+        for (let t of hitTexts) {
+            canvasCtx.fillStyle = t.color.replace('hsl', 'hsla').replace(')', `, ${t.alpha})`);
+            canvasCtx.font = "bold 32px Arial";
+            // Simple text glow
+            canvasCtx.shadowBlur = 10;
+            canvasCtx.shadowColor = t.color;
+            canvasCtx.fillText(t.text, -t.x, t.y);
+        }
+        canvasCtx.restore();
+
+        canvasCtx.restore();
+    }
+
+    // --- INITIALIZATION (Keep this logic the same) ---
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7, // Higher confidence for cleaner tracking
+        minTrackingConfidence: 0.7
+    });
+    hands.onResults(onResults);
+
+    startBtn.addEventListener('click', () => {
+        startBtn.style.display = 'none';
+        loadingText.style.display = 'block';
+
+        // Resume audio context
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                loadingText.style.display = 'none';
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+    });
+
+</script>
+</body>
+</html>
